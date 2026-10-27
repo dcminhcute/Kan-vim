@@ -102,6 +102,21 @@ def train_step(model, teacher, x, y, opt, scaler, a, dev, amp, mix=None):
     return loss, out
 
 
+@torch.no_grad()
+def probe_stats(model, pruner, x, prev, dev, amp):
+    """Stability of the learned selection on a fixed batch (eval mode):
+    raw_std = std of the scores before the z-score, scorer_norm = L2 norm of the scorer weights,
+    flip = fraction of the kept tokens that were not kept at the previous epoch (None at the first one)."""
+    model.eval()
+    with torch.autocast(dev, dtype=AMP_DTYPE, enabled=amp and dev == "cuda"):
+        model(x)
+    idx = pruner.aux["idx"]
+    kept = torch.zeros(idx.shape[0], pruner.n, device=idx.device).scatter_(1, idx, 1.0)
+    flip = None if prev is None else ((kept - prev).clamp(min=0).sum() / kept.sum()).item()
+    norm = sum(p.detach().float().pow(2).sum() for p in pruner.parameters()).sqrt().item()
+    return {"raw_std": float(pruner.aux["raw_std"]), "scorer_norm": norm, "flip": flip}, kept
+
+
 def _cycle(loader):
     while True:
         yield from loader
@@ -179,6 +194,12 @@ def main():
                     help="prune: z-score the scores per image before noise / top-M / sigmoid (scale-free selection)")
     ap.add_argument("--gumbel", type=float, default=1.0,
                     help="prune: Gumbel noise scale at the start of training, annealed linearly to 0 (legacy: fixed 1)")
+    ap.add_argument("--wd_reducer", type=float, default=None,
+                    help="weight decay of the reducer (default: --wd). With --prune_norm the selection is invariant to "
+                         "the scorer's scale, so weight decay only shrinks it and raises the effective lr: use 0")
+    ap.add_argument("--freeze_reducer", type=float, default=0.0,
+                    help="prune st: fraction of the last epochs with the scorer frozen (fixed selection, no noise); "
+                         "the Gumbel noise then reaches 0 when the freeze starts")
     ap.add_argument("--distill", type=float, default=0.5, help="KL weight to the un-reduced teacher")
     ap.add_argument("--teacher_ckpt", default=None,
                     help="fine-tuned identity baseline on the SAME dataset (saved with --save_ckpt); no distillation if absent")
@@ -255,7 +276,8 @@ def main():
         groups.append({"params": [p for n, p in body if no_wd(n, p)], "lr": a.lr, "weight_decay": 0.0})
     opt = torch.optim.AdamW(groups + [
         {"params": list(model.backbone.head.parameters()), "lr": a.lr_head},
-        {"params": list(model.reducer.parameters()) + list(model.stages.parameters()), "lr": a.lr_reducer}],
+        {"params": list(model.reducer.parameters()) + list(model.stages.parameters()), "lr": a.lr_reducer,
+         "weight_decay": a.wd if a.wd_reducer is None else a.wd_reducer}],
         weight_decay=a.wd)
     per_epoch = min(len(tr), a.max_steps) if a.max_steps else len(tr)
     steps = a.epochs * per_epoch
@@ -284,6 +306,11 @@ def main():
             print(f"resumed from epoch {start_ep} (best val {best['val_top1']:.2f} @ {best['epoch']})", flush=True)
 
     # ---- train --------------------------------------------------------------------------------
+    freeze_ep = a.epochs
+    if pruners and a.freeze_reducer > 0:
+        freeze_ep = min(a.epochs - 1, max(1, round(a.epochs * (1 - a.freeze_reducer))))
+    probe_x = next(iter(va if va is not None else te))[0][:64].to(dev) if pruners else None
+    probe_prev = None
     stopped = "completed"
     for ep in range(start_ep, a.epochs):
         if a.patience and bad >= a.patience:
@@ -295,6 +322,10 @@ def main():
                 print(f"PAUSED before epoch {ep}: not enough time left. Run again to resume.", flush=True)
                 sys.exit(PAUSED)
         model.train()
+        if ep >= freeze_ep:  # fixed selection: only the backbone adapts to it
+            for r in pruners:
+                r.frozen = True
+                r.requires_grad_(False)
         t0 = time.time()
         loss_sum = hit = n = 0
         for it, (x, y) in enumerate(tr):
@@ -302,8 +333,9 @@ def main():
                 break
             x, y = x.to(dev, non_blocking=True), y.to(dev, non_blocking=True)
             x, mix = mix_batch(x, y, a)
-            for r in pruners:  # st: Gumbel noise a.gumbel -> 0 over training; legacy: fixed (first version)
-                r.noise = a.gumbel * (1 - (ep * per_epoch + it) / steps) if a.prune_mode == "st" else 1.0
+            for r in pruners:  # st: Gumbel noise a.gumbel -> 0 at freeze_ep (default: end); legacy: fixed (first version)
+                r.noise = a.gumbel * max(0.0, 1 - (ep * per_epoch + it) / (freeze_ep * per_epoch)) \
+                    if a.prune_mode == "st" else 1.0
             loss, out = train_step(model, teacher, x, y, opt, scaler, a, dev, amp, mix)
             sched.step()
             loss_sum += loss.item() * y.numel()
@@ -314,6 +346,9 @@ def main():
         rec = {"epoch": ep, "loss": loss_sum / n, "train_loss": loss_sum / n, "train_top1": 100.0 * hit / n,
                "top1": acc, "val_loss": eval_loss, "lr": sched.get_last_lr()[0],
                "train_min": t_train / 60, "total_min": (time.time() - t0) / 60}
+        if pruners:
+            stats, probe_prev = probe_stats(model, pruners[0], probe_x, probe_prev, dev, amp)
+            rec.update(stats)
         log.append(rec)
         if acc > best["val_top1"]:
             best, bad = {"val_top1": acc, "epoch": ep}, 0
@@ -326,7 +361,10 @@ def main():
         print(f"epoch {ep} train_loss {rec['train_loss']:.3f} train_top1 {rec['train_top1']:.2f} | "
               f"{'val' if va is not None else 'test'}_loss {eval_loss:.3f} top1 {acc:.2f} "
               f"(best {best['val_top1']:.2f} @ {best['epoch']}) | train {t_train / 60:.1f} min, "
-              f"train+eval {rec['total_min']:.1f} min", flush=True)
+              f"train+eval {rec['total_min']:.1f} min"
+              + (f" | raw_std {rec['raw_std']:.3g} scorer_norm {rec['scorer_norm']:.3g} flip "
+                 + ("-" if rec["flip"] is None else f"{rec['flip']:.3f}") + (" (frozen)" if ep >= freeze_ep else "")
+                 if pruners else ""), flush=True)
         if last_pt:
             torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "sched": sched.state_dict(),
                         "scaler": scaler.state_dict(), "epoch": ep, "log": log, "bad": bad, "best": best,

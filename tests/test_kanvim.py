@@ -115,6 +115,21 @@ def test_prune_norm_keeps_gradient_when_scores_blow_up(name):
     assert share_with_grad(True) == 1.0
 
 
+@pytest.mark.parametrize("name", ["kan_prune", "mlp_prune"])
+def test_prune_frozen_fixes_selection_but_keeps_input_gradient(name):
+    """--freeze_reducer: no gradient into the scorer, same selection as eval, x still gets a gradient"""
+    r = build_reducer(name, D, GRID, 0.5, kan_hidden=8, prune_norm=True)
+    x = torch.randn(2, 196, D, requires_grad=True)
+    r.eval()(x)
+    idx = r.aux["idx"]
+    r.train()
+    r.noise, r.frozen = 0.0, True
+    r(x).pow(2).sum().backward()
+    assert torch.equal(idx, r.aux["idx"])
+    assert all(p.grad is None for p in r.scorer.parameters())
+    assert x.grad is not None and x.grad.abs().sum() > 0
+
+
 def test_avg_pool_is_group_mean_and_max_pool_is_max():
     x = torch.randn(1, 196, D)
     a = build_reducer("avg_pool", D, GRID, 0.25)

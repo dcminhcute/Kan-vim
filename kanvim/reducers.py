@@ -124,7 +124,10 @@ class PruneReducer(Reducer):
     norm=True (--prune_norm): the scores are z-scored per image before the noise, the top-M and the
       sigmoid, so `noise` and `temp` keep their meaning whatever the scorer's output scale. Without it the
       scale drifts freely: measured on CIFAR-100, the KAN scores collapsed to a constant (std 0.005, the
-      noise then picks the tokens at random) and the MLP scores blew up (std 815, sigmoid saturated)."""
+      noise then picks the tokens at random) and the MLP scores blew up (std 815, sigmoid saturated).
+    frozen=True (set by train.py --freeze_reducer): the scores carry no gradient, so the selection is fixed
+      and only the backbone adapts to it (the kept / fused tokens still pass gradient to x).
+    aux["raw_std"]: per-image std of the scores before the z-score, to watch the scale drift."""
 
     def __init__(self, n_tokens, keep_ratio, kind, dim, hidden, grid_size=5, mode="st", temp=1.0, norm=False):
         super().__init__(n_tokens, keep_ratio)
@@ -132,12 +135,15 @@ class PruneReducer(Reducer):
         self.scorer = make_scorer(kind, dim, hidden, grid_size)
         self.mode, self.temp, self.norm = mode, temp, norm
         self.noise = 1.0  # Gumbel noise scale while training (set by train.py)
+        self.frozen = False  # fixed selection, no gradient into the scores (set by train.py)
 
     def forward(self, x):
         b, n, d = x.shape
-        logits = self.scorer(x).squeeze(-1).float()
+        with torch.set_grad_enabled(torch.is_grad_enabled() and not self.frozen):
+            raw = self.scorer(x).squeeze(-1).float()
+        logits = raw
         if self.norm:
-            logits = (logits - logits.mean(1, keepdim=True)) / (logits.std(1, keepdim=True) + 1e-6)
+            logits = (raw - raw.mean(1, keepdim=True)) / (raw.std(1, keepdim=True) + 1e-6)
         sel = logits
         if self.training and self.noise > 0:
             u = torch.rand_like(logits).clamp_(1e-9, 1 - 1e-9)
@@ -147,7 +153,7 @@ class PruneReducer(Reducer):
             kept = x.gather(1, idx.unsqueeze(-1).expand(-1, -1, d))
             p = torch.sigmoid(logits).gather(1, idx)
             kept = kept * (p + (1 - p).detach()).unsqueeze(-1).to(x.dtype)
-            self.aux = {"logits": logits.detach(), "idx": idx.detach()}
+            self.aux = {"logits": logits.detach(), "idx": idx.detach(), "raw_std": raw.detach().std(1).mean()}
             return kept
         k = self.m - 1  # kept tokens; the M-th slot is the fused token
         assert 1 <= k < n, (n, self.m)
@@ -160,7 +166,7 @@ class PruneReducer(Reducer):
         xf = x.float()
         kept = (xf * mask).gather(1, idx.unsqueeze(-1).expand(-1, -1, d))
         fused = (xf * (1 - mask)).sum(1, keepdim=True) / (n - k)
-        self.aux = {"logits": logits.detach(), "idx": idx.detach()}
+        self.aux = {"logits": logits.detach(), "idx": idx.detach(), "raw_std": raw.detach().std(1).mean()}
         return torch.cat([kept, fused], 1).to(x.dtype)
 
     def extra_reg(self):
