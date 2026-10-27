@@ -1,0 +1,7 @@
+torch>=2.1
+torchvision
+timm==0.4.12        # version used by hustvl/Vim
+numpy
+pytest
+# GPU only (Linux/WSL2/Colab/Kaggle), installed by scripts/setup_gpu.sh:
+# causal-conv1d, mamba-ssm (Vim's fork)
