@@ -120,11 +120,13 @@ def prepare(a):
 def command(a, r, ratio, seed, tag, extra):
     name = os.path.splitext(result_name(r, ratio, seed, tag))[0]
     cmd = [PY, os.path.join(ROOT, "train.py"), "--dataset", "cifar100", "--data_root", a.data_root,
-           "--backbone", "tiny", "--ckpt", a.ckpt, "--impl", a.impl, "--batch", "64", "--workers", str(a.workers),
+           "--backbone", "tiny", "--ckpt", a.ckpt, "--impl", a.impl, "--batch", str(a.batch), "--workers", str(a.workers),
            "--val_size", "5000", "--mixup", "0.2", "--cutmix", "0.0", "--clip_grad", "1.0",
            "--epochs", "30", "--patience", str(a.patience), "--lr", "1e-4", "--teacher_ckpt", a.teacher,
            "--reducer", r, "--ratio", str(ratio), "--seed", str(seed), "--prune_mode", "st",
            "--out", a.out, "--resume_dir", os.path.join(a.out, "state", name)] + (["--prune_norm"] if a.prune_norm else []) + extra
+    if a.quick:  # vài bước mỗi epoch: chỉ để bắt lỗi trước khi chạy thật
+        cmd += ["--epochs", "2", "--max_steps", "20", "--no_bench"]
     if tag:
         cmd += ["--tag", tag]
     return name, cmd
@@ -288,6 +290,9 @@ def main():
                     help="đợt so sánh lr backbone 5e-5 (Pool/Drop + Prune, giữ 50%%), bảng KET_QUA_LR.md")
     ap.add_argument("--stab_round", action="store_true",
                     help="đợt sửa độ ổn định của Prune (wd0 / g03 / frz, lr 5e-5, seed 1 rồi 0), bảng KET_QUA_STAB.md")
+    ap.add_argument("--quick", action="store_true",
+                    help="chạy thử: mỗi job 2 epoch x 20 bước, không đo tốc độ (dùng --out riêng, vd results_quick)")
+    ap.add_argument("--batch", type=int, default=64, help="chỉ đổi khi chạy thử trên GPU ít VRAM (kết quả thật: 64)")
     ap.add_argument("--gpus", default=None, help="vd '0,1'. Mặc định: tất cả GPU")
     ap.add_argument("--workers", type=int, default=min(12, os.cpu_count() or 4))
     a = ap.parse_args()
