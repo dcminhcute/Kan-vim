@@ -20,6 +20,12 @@ Kết quả: results_fix/*.json, bảng so sánh results_fix/KET_QUA_FIX.md, log
                    frz: đóng băng bộ chấm điểm 1/3 số epoch cuối}
   seed 1 trước (KAN seed 1 sụt nặng nhất: val 82,92 -> 74,06), rồi seed 0                        12 job
   Bảng: <out>/KET_QUA_STAB.md (mốc so sánh: cùng seed, lr 5e-5 của results_lr)
+
+Đợt giảm token sau khối L (--ctx_round, mặc định L = --reduce_at 6, tự bật --prune_norm, lr backbone 5e-5, giữ 50%):
+  bộ chấm điểm thấy token đã qua L khối Mamba (có ngữ cảnh) thay vì patch embedding thô.
+  KAN/MLP Prune, KANPool/MLP Pool, Static Drop x seed 0/1/2 (seed 0 của cả 5 phương pháp chạy trước)   15 job
+  Checkpoint seed 0 của 4 phương pháp có học: <out>_ckpt/ (để vẽ hình diễn giải)
+  Bảng: <out>/KET_QUA_CTX.md (mốc so sánh: giảm token ở đầu vào, lr 5e-5 của results_lr)
 """
 import argparse
 import glob
@@ -91,6 +97,29 @@ def jobs_stab():
             for s in STAB_SEEDS for t, _, extra in STAB for r in NAMES]
 
 
+# --ctx_round: mốc = giảm token ngay sau patch embedding, lr 5e-5, giữ 50% (results_lr), seed 0/1/2
+CTX_BASE = {"kan_prune": [83.81, 82.37, 82.72], "mlp_prune": [81.65, 79.10, 81.13], "kan_pool": [84.74, 84.93, 84.98],
+            "mlp_pool": [84.82, 85.60, 85.29], "static_drop": [85.68, 85.46, 85.77]}
+CTX_PAIRS = [("kan_prune", "mlp_prune"), ("kan_pool", "mlp_pool")]
+
+
+def ctx_tag(a):
+    return f"L{a.reduce_at}_lr5e-5"
+
+
+def jobs_ctx(a):
+    os.makedirs(a.out + "_ckpt", exist_ok=True)
+    out = []
+    for s in (0, 1, 2):
+        for r in CTX_BASE:
+            extra = ["--lr", "5e-5", "--reduce_at", str(a.reduce_at)]
+            if s == 0 and r != "static_drop":
+                name = os.path.splitext(result_name(r, 0.5, s, ctx_tag(a)))[0]
+                extra += ["--save_ckpt", os.path.join(a.out + "_ckpt", name + ".pt")]
+            out.append((r, 0.5, s, ctx_tag(a), extra))
+    return out
+
+
 def result_name(r, ratio, seed, tag):
     return f"cifar100_tiny_{r}_r{ratio}_s{seed}{'_' + tag if tag else ''}.json"
 
@@ -133,7 +162,7 @@ def command(a, r, ratio, seed, tag, extra):
 
 
 def run_all(a, gpus):
-    all_jobs = jobs_stab() if a.stab_round else jobs_lr() if a.lr_round else jobs()
+    all_jobs = jobs_ctx(a) if a.ctx_round else jobs_stab() if a.stab_round else jobs_lr() if a.lr_round else jobs()
     todo = [j for j in all_jobs if not os.path.exists(os.path.join(a.out, result_name(*j[:4])))]
     log(f"{len(all_jobs)} job, đã xong {len(all_jobs) - len(todo)}, còn {len(todo)}, GPU {gpus}")
     if a.limit:
@@ -192,6 +221,8 @@ def load_results(out):
 
 def report(a):
     res = load_results(a.out)
+    if a.ctx_round:
+        return report_ctx(a, res)
     if a.stab_round:
         return report_stab(a, res)
     if a.lr_round:
@@ -276,6 +307,36 @@ def report_stab(a, res):
     open(os.path.join(a.out, "KET_QUA_STAB.md"), "w", encoding="utf-8").write("\n".join(L) + "\n")
 
 
+def report_ctx(a, res):
+    f2 = lambda x: f"{x:.2f}".replace(".", ",")
+    tag = ctx_tag(a)
+    runs = {r: [res.get((r, 0.5, s, tag)) for s in (0, 1, 2)] for r in CTX_BASE}
+    gmacs = next((d["GMACs"] for ds in runs.values() for d in ds if d), None)
+    L = [f"# Giảm token sau khối {a.reduce_at} (CIFAR-100, giữ 50%)", "",
+         f"Một bộ giảm token đặt trước khối {a.reduce_at} của Vim-Ti: {a.reduce_at} khối đầu chạy đủ 196 token, nên bộ "
+         "chấm điểm thấy token đã có ngữ cảnh. Mốc = giảm token ngay sau patch embedding (results_lr). Cùng cấu hình: "
+         f"lr backbone 5e-5, st + --prune_norm, patience {a.patience}, chọn mô hình theo val.", "",
+         f"GMACs: sau khối {a.reduce_at} = {f2(gmacs) if gmacs else '-'}; ở đầu vào = 0,76; baseline 100% token = 1,47.", "",
+         "## Test top-1 (%)", "",
+         f"| Phương pháp | seed 0 | seed 1 | seed 2 | **Sau khối {a.reduce_at}** | Ở đầu vào | Chênh |",
+         "|---|---|---|---|---|---|---|"]
+    for r, base in CTX_BASE.items():
+        xs = [d["top1"] for d in runs[r] if d]
+        cells = [f2(d["top1"]) if d else "-" for d in runs[r]]
+        diff = f"{statistics.mean(xs) - statistics.mean(base):+.2f}".replace(".", ",") if xs else "-"
+        L.append(f"| {LR_NAMES[r]} | {' | '.join(cells)} | **{fmt(xs)}** | {fmt(base)} | {diff} |")
+    L += ["", "## KAN trừ MLP, ghép cặp theo seed (điểm %)", "",
+          f"| Cặp | Sau khối {a.reduce_at}: từng seed | Trung bình | Ở đầu vào: từng seed | Trung bình |",
+          "|---|---|---|---|---|"]
+    for k, m in CTX_PAIRS:
+        d = [x["top1"] - y["top1"] for x, y in zip(runs[k], runs[m]) if x and y]
+        d0 = [x - y for x, y in zip(CTX_BASE[k], CTX_BASE[m])]
+        sd = lambda v: " / ".join(f"{x:+.2f}".replace(".", ",") for x in v) or "-"
+        L.append(f"| {LR_NAMES[k]} − {LR_NAMES[m]} | {sd(d)} | {fmt(d)} | {sd(d0)} | {fmt(d0)} |")
+    L += ["", f"Checkpoint seed 0 (KAN/MLP Prune, KANPool/MLP Pool): {os.path.basename(a.out)}_ckpt/."]
+    open(os.path.join(a.out, "KET_QUA_CTX.md"), "w", encoding="utf-8").write("\n".join(L) + "\n")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_root", default=os.path.join(ROOT, "data"))
@@ -290,13 +351,17 @@ def main():
                     help="đợt so sánh lr backbone 5e-5 (Pool/Drop + Prune, giữ 50%%), bảng KET_QUA_LR.md")
     ap.add_argument("--stab_round", action="store_true",
                     help="đợt sửa độ ổn định của Prune (wd0 / g03 / frz, lr 5e-5, seed 1 rồi 0), bảng KET_QUA_STAB.md")
+    ap.add_argument("--ctx_round", action="store_true",
+                    help="đợt giảm token sau khối --reduce_at (KAN/MLP Prune, KAN/MLP Pool, Static Drop, 3 seed), "
+                         "bảng KET_QUA_CTX.md")
+    ap.add_argument("--reduce_at", type=int, default=6, help="--ctx_round: giảm token trước khối này")
     ap.add_argument("--quick", action="store_true",
                     help="chạy thử: mỗi job 2 epoch x 20 bước, không đo tốc độ (dùng --out riêng, vd results_quick)")
     ap.add_argument("--batch", type=int, default=64, help="chỉ đổi khi chạy thử trên GPU ít VRAM (kết quả thật: 64)")
     ap.add_argument("--gpus", default=None, help="vd '0,1'. Mặc định: tất cả GPU")
     ap.add_argument("--workers", type=int, default=min(12, os.cpu_count() or 4))
     a = ap.parse_args()
-    if a.stab_round:
+    if a.stab_round or a.ctx_round:
         a.prune_norm = True
     import torch
     gpus = [int(g) for g in a.gpus.split(",")] if a.gpus else list(range(torch.cuda.device_count()))
@@ -310,7 +375,7 @@ def main():
     shutil.make_archive(a.out, "zip", os.path.dirname(a.out), os.path.basename(a.out))
     done = "XONG CHẠY THỬ" if a.limit else "XONG TOÀN BỘ"
     log(f"{done if not failed else 'XONG, có job lỗi: ' + ', '.join(failed)}. "
-        f"Bảng: {a.out}/{'KET_QUA_STAB.md' if a.stab_round else 'KET_QUA_LR.md' if a.lr_round else 'KET_QUA_FIX.md'}"
+        f"Bảng: {a.out}/{'KET_QUA_CTX.md' if a.ctx_round else 'KET_QUA_STAB.md' if a.stab_round else 'KET_QUA_LR.md' if a.lr_round else 'KET_QUA_FIX.md'}"
         f" | tải về: {a.out}.zip")
 
 

@@ -266,6 +266,23 @@ def test_multistage_tokens_match_single_stage_macs_and_forward():
     assert out.shape == (2, 10) and all(p.grad is not None for p in m.stages.parameters() if p.requires_grad)
 
 
+@pytest.mark.parametrize("name", ["kan_prune", "mlp_prune", "kan_pool", "mlp_pool", "static_drop"])
+def test_reduce_at_later_block(name):
+    """--reduce_at L: one reducer on the residual stream before block L, all 196 tokens before it."""
+    from kanvim.vim_pure import VimPure
+    L, depth = 2, 6
+    red = build_reducer(name, D, GRID, 0.5, kan_hidden=8, prune_norm=True)
+    m = ReducedVim(VimPure(D, depth, 10), build_reducer("identity", D, GRID, 1.0), stages=[(L, red)])
+    assert m.layer_tokens() == [197] * L + [99] * (depth - L)
+    out = m.train()(torch.randn(2, 3, 224, 224))
+    out.sum().backward()
+    assert out.shape == (2, 10)
+    assert all(p.grad is not None for p in m.stages.parameters())
+    assert m.eval()(torch.randn(2, 3, 224, 224)).shape == (2, 10)
+    single = ReducedVim(VimPure(D, depth, 10), build_reducer(name, D, GRID, 0.5, kan_hidden=8))
+    assert total_macs(single, D, depth, num_classes=10) < total_macs(m, D, depth, num_classes=10)
+
+
 def test_mtr_merge_keeps_order_and_count():
     from kanvim.mtr import mtr_merge, mtr_schedule
     x = torch.arange(10.).view(1, 10, 1).repeat(2, 1, 3)

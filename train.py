@@ -163,6 +163,9 @@ def main():
     ap.add_argument("--data_root", default="./data")
     ap.add_argument("--reducer", default="identity")
     ap.add_argument("--ratio", type=float, default=1.0)
+    ap.add_argument("--reduce_at", type=int, default=0,
+                    help="block before which the single reducer runs (0 = right after patch embedding). L>0: blocks "
+                         "0..L-1 see all 196 tokens, so the scorer sees contextualised tokens (DynamicViT / DyVM)")
     ap.add_argument("--backbone", default="tiny", choices=list(DIMS))
     ap.add_argument("--ckpt", default=None)
     ap.add_argument("--seed", type=int, default=0)
@@ -250,9 +253,14 @@ def main():
                                                    prune_mode=a.prune_mode, prune_temp=a.prune_temp,
                                                    prune_norm=a.prune_norm)).to(dev)
     else:
-        model = ReducedVim(backbone, build_reducer(a.reducer, dim, (14, 14), a.ratio, a.kan_hidden, a.grid_size,
-                                                   a.prune_mode, a.prune_temp, a.prune_norm),
-                           grad_ckpt=a.grad_ckpt).to(dev)
+        red = build_reducer(a.reducer, dim, (14, 14), a.ratio, a.kan_hidden, a.grid_size,
+                            a.prune_mode, a.prune_temp, a.prune_norm)
+        if a.reduce_at > 0:  # identity at the input, the reducer on the residual stream before block reduce_at
+            assert a.reduce_at < depth, (a.reduce_at, depth)
+            model = ReducedVim(backbone, build_reducer("identity", dim, (14, 14), 1.0), grad_ckpt=a.grad_ckpt,
+                               stages=[(a.reduce_at, red)]).to(dev)
+        else:
+            model = ReducedVim(backbone, red, grad_ckpt=a.grad_ckpt).to(dev)
     pruners = [r for r in [model.reducer, *model.stages] if hasattr(r, "noise")]
     reducer = model.reducer
     red_params = lambda: sum(p.numel() for p in model.reducer.parameters()) + sum(p.numel() for p in model.stages.parameters())
