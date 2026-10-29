@@ -26,6 +26,10 @@ Kết quả: results_fix/*.json, bảng so sánh results_fix/KET_QUA_FIX.md, log
   KAN/MLP Prune, KANPool/MLP Pool, Static Drop x seed 0/1/2 (seed 0 của cả 5 phương pháp chạy trước)   15 job
   Checkpoint seed 0 của 4 phương pháp có học: <out>_ckpt/ (để vẽ hình diễn giải)
   Bảng: <out>/KET_QUA_CTX.md (mốc so sánh: giảm token ở đầu vào, lr 5e-5 của results_lr)
+
+Đợt giữ 25% sau khối L (--r25_round, cùng cấu hình --ctx_round, chỉ đổi tỉ lệ giữ 0.5 -> 0.25):
+  có học có thắng chọn đều khi bỏ 3/4 số token không. KANPool, MLP Pool, Static Drop, Avg Pool x seed 0/1/2   12 job
+  Bảng: <out>/KET_QUA_R25.md (KPI đặt trước: có học hơn Static Drop ở cả 3 seed và trung bình > 2 x độ lệch)
 """
 import argparse
 import glob
@@ -120,6 +124,19 @@ def jobs_ctx(a):
     return out
 
 
+# --r25_round: giữ 25% sau khối L. Mốc giữ 50% = results_ctx (cùng vị trí, cùng cấu hình), seed 0/1/2
+R25_BASE = {"kan_pool": [87.37, 87.46, 87.30], "mlp_pool": [87.26, 87.35, 87.67],
+            "static_drop": [87.41, 86.66, 87.27], "avg_pool": []}
+R25_NAMES = {**LR_NAMES, "avg_pool": "Avg Pool"}
+R25_PAIRS = [("kan_pool", "static_drop"), ("mlp_pool", "static_drop"), ("kan_pool", "avg_pool"),
+             ("kan_pool", "mlp_pool")]
+
+
+def jobs_r25(a):
+    extra = ["--lr", "5e-5", "--reduce_at", str(a.reduce_at)]
+    return [(r, 0.25, s, ctx_tag(a), extra) for s in (0, 1, 2) for r in R25_BASE]
+
+
 def result_name(r, ratio, seed, tag):
     return f"cifar100_tiny_{r}_r{ratio}_s{seed}{'_' + tag if tag else ''}.json"
 
@@ -162,7 +179,7 @@ def command(a, r, ratio, seed, tag, extra):
 
 
 def run_all(a, gpus):
-    all_jobs = jobs_ctx(a) if a.ctx_round else jobs_stab() if a.stab_round else jobs_lr() if a.lr_round else jobs()
+    all_jobs = jobs_r25(a) if a.r25_round else jobs_ctx(a) if a.ctx_round else jobs_stab() if a.stab_round else jobs_lr() if a.lr_round else jobs()
     todo = [j for j in all_jobs if not os.path.exists(os.path.join(a.out, result_name(*j[:4])))]
     log(f"{len(all_jobs)} job, đã xong {len(all_jobs) - len(todo)}, còn {len(todo)}, GPU {gpus}")
     if a.limit:
@@ -221,6 +238,8 @@ def load_results(out):
 
 def report(a):
     res = load_results(a.out)
+    if a.r25_round:
+        return report_r25(a, res)
     if a.ctx_round:
         return report_ctx(a, res)
     if a.stab_round:
@@ -337,6 +356,37 @@ def report_ctx(a, res):
     open(os.path.join(a.out, "KET_QUA_CTX.md"), "w", encoding="utf-8").write("\n".join(L) + "\n")
 
 
+def report_r25(a, res):
+    f2 = lambda x: f"{x:.2f}".replace(".", ",")
+    tag = ctx_tag(a)
+    runs = {r: [res.get((r, 0.25, s, tag)) for s in (0, 1, 2)] for r in R25_BASE}
+    gmacs = next((d["GMACs"] for ds in runs.values() for d in ds if d), None)
+    L = [f"# Giữ 25% token sau khối {a.reduce_at} (CIFAR-100)", "",
+         f"Cùng cấu hình results_ctx (lr backbone 5e-5, patience {a.patience}, chọn mô hình theo val), chỉ đổi tỉ lệ giữ "
+         f"50% -> 25%. GMACs: {f2(gmacs) if gmacs else '-'} (giữ 50%: 0,94; baseline: 1,47).", "",
+         "## Test top-1 (%)", "",
+         "| Phương pháp | seed 0 | seed 1 | seed 2 | **Giữ 25%** | Giữ 50% (results_ctx) |",
+         "|---|---|---|---|---|---|"]
+    for r, base in R25_BASE.items():
+        xs = [d["top1"] for d in runs[r] if d]
+        cells = [f2(d["top1"]) if d else "-" for d in runs[r]]
+        L.append(f"| {R25_NAMES[r]} | {' | '.join(cells)} | **{fmt(xs)}** | {fmt(base)} |")
+    L += ["", "## Hiệu số ghép cặp theo seed (điểm %)", "",
+          "KPI đặt trước khi chạy: **đạt** nếu hiệu số dương ở cả 3 seed và trung bình > 2 × độ lệch chuẩn.", "",
+          "| Cặp | Từng seed | Trung bình ± độ lệch | KPI |", "|---|---|---|---|"]
+    for k, m in R25_PAIRS:
+        d = [x["top1"] - y["top1"] for x, y in zip(runs[k], runs[m]) if x and y]
+        if len(d) < 3:
+            verdict = f"chờ ({len(d)}/3 seed)"
+        elif all(x > 0 for x in d) and statistics.mean(d) > 2 * statistics.stdev(d):
+            verdict = "**đạt**"
+        else:
+            verdict = "không đạt"
+        L.append(f"| {R25_NAMES[k]} − {R25_NAMES[m]} | {' / '.join(f'{x:+.2f}'.replace('.', ',') for x in d) or '-'} "
+                 f"| {fmt(d)} | {verdict} |")
+    open(os.path.join(a.out, "KET_QUA_R25.md"), "w", encoding="utf-8").write("\n".join(L) + "\n")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_root", default=os.path.join(ROOT, "data"))
@@ -354,14 +404,16 @@ def main():
     ap.add_argument("--ctx_round", action="store_true",
                     help="đợt giảm token sau khối --reduce_at (KAN/MLP Prune, KAN/MLP Pool, Static Drop, 3 seed), "
                          "bảng KET_QUA_CTX.md")
-    ap.add_argument("--reduce_at", type=int, default=6, help="--ctx_round: giảm token trước khối này")
+    ap.add_argument("--r25_round", action="store_true",
+                    help="đợt giữ 25%% sau khối --reduce_at (KAN/MLP Pool, Static Drop, Avg Pool, 3 seed), bảng KET_QUA_R25.md")
+    ap.add_argument("--reduce_at", type=int, default=6, help="--ctx_round / --r25_round: giảm token trước khối này")
     ap.add_argument("--quick", action="store_true",
                     help="chạy thử: mỗi job 2 epoch x 20 bước, không đo tốc độ (dùng --out riêng, vd results_quick)")
     ap.add_argument("--batch", type=int, default=64, help="chỉ đổi khi chạy thử trên GPU ít VRAM (kết quả thật: 64)")
     ap.add_argument("--gpus", default=None, help="vd '0,1'. Mặc định: tất cả GPU")
     ap.add_argument("--workers", type=int, default=min(12, os.cpu_count() or 4))
     a = ap.parse_args()
-    if a.stab_round or a.ctx_round:
+    if a.stab_round or a.ctx_round or a.r25_round:
         a.prune_norm = True
     import torch
     gpus = [int(g) for g in a.gpus.split(",")] if a.gpus else list(range(torch.cuda.device_count()))
@@ -375,7 +427,7 @@ def main():
     shutil.make_archive(a.out, "zip", os.path.dirname(a.out), os.path.basename(a.out))
     done = "XONG CHẠY THỬ" if a.limit else "XONG TOÀN BỘ"
     log(f"{done if not failed else 'XONG, có job lỗi: ' + ', '.join(failed)}. "
-        f"Bảng: {a.out}/{'KET_QUA_CTX.md' if a.ctx_round else 'KET_QUA_STAB.md' if a.stab_round else 'KET_QUA_LR.md' if a.lr_round else 'KET_QUA_FIX.md'}"
+        f"Bảng: {a.out}/{'KET_QUA_R25.md' if a.r25_round else 'KET_QUA_CTX.md' if a.ctx_round else 'KET_QUA_STAB.md' if a.stab_round else 'KET_QUA_LR.md' if a.lr_round else 'KET_QUA_FIX.md'}"
         f" | tải về: {a.out}.zip")
 
 
