@@ -89,6 +89,25 @@ def test_prune_st_without_noise_selects_like_eval():
 
 
 @pytest.mark.parametrize("name", ["kan_prune", "mlp_prune"])
+def test_prune_cover_always_keeps_the_static_positions(name):
+    """--prune_cover 0.5 at 25%: 24 of the 48 kept slots are the evenly spaced tokens, whatever the scores;
+    the other 24 come from the scorer, the order is preserved and the scorer still gets a gradient"""
+    r = build_reducer(name, D, GRID, 0.25, kan_hidden=8, prune_norm=True, prune_cover=0.5).train()
+    assert len(r.cover_idx) == 24
+    x = torch.randn(2, 196, D)
+    y = r(x)
+    idx = r.aux["idx"]
+    assert y.shape == (2, 49, D) and (idx[:, 1:] > idx[:, :-1]).all()
+    assert all(set(r.cover_idx.tolist()) <= set(i.tolist()) for i in idx)
+    h = r.scorer.register_forward_hook(lambda m, i, o: -o)  # reversed scores: other picks, same coverage
+    r.eval()(x)
+    h.remove()
+    assert all(set(r.cover_idx.tolist()) <= set(i.tolist()) for i in r.aux["idx"])
+    g, _ = _score_grads(r.train(), x)
+    assert g.abs().sum() > 0
+
+
+@pytest.mark.parametrize("name", ["kan_prune", "mlp_prune"])
 def test_prune_norm_is_invariant_to_score_scale(name):
     """--prune_norm: scaling / shifting the scorer output changes neither the selection nor the output"""
     r = build_reducer(name, D, GRID, 0.5, kan_hidden=8, prune_norm=True).eval()

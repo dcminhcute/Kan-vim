@@ -195,6 +195,9 @@ def main():
     ap.add_argument("--prune_temp", type=float, default=1.0, help="st: temperature of the sigmoid surrogate mask")
     ap.add_argument("--prune_norm", action="store_true",
                     help="prune: z-score the scores per image before noise / top-M / sigmoid (scale-free selection)")
+    ap.add_argument("--prune_cover", type=float, default=0.0,
+                    help="prune st: fraction of the kept slots given to evenly spaced tokens (Static Drop positions), "
+                         "the scorer picks the rest")
     ap.add_argument("--gumbel", type=float, default=1.0,
                     help="prune: Gumbel noise scale at the start of training, annealed linearly to 0 (legacy: fixed 1)")
     ap.add_argument("--wd_reducer", type=float, default=None,
@@ -254,7 +257,7 @@ def main():
                                                    prune_norm=a.prune_norm)).to(dev)
     else:
         red = build_reducer(a.reducer, dim, (14, 14), a.ratio, a.kan_hidden, a.grid_size,
-                            a.prune_mode, a.prune_temp, a.prune_norm)
+                            a.prune_mode, a.prune_temp, a.prune_norm, a.prune_cover)
         if a.reduce_at > 0:  # identity at the input, the reducer on the residual stream before block reduce_at
             assert a.reduce_at < depth, (a.reduce_at, depth)
             model = ReducedVim(backbone, build_reducer("identity", dim, (14, 14), 1.0), grad_ckpt=a.grad_ckpt,

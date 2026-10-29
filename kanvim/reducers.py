@@ -127,13 +127,22 @@ class PruneReducer(Reducer):
       noise then picks the tokens at random) and the MLP scores blew up (std 815, sigmoid saturated).
     frozen=True (set by train.py --freeze_reducer): the scores carry no gradient, so the selection is fixed
       and only the backbone adapts to it (the kept / fused tokens still pass gradient to x).
+    cover=c (--prune_cover, st only): round(c * (M-1)) of the kept slots go to evenly spaced tokens (the Static Drop
+      positions), always kept; the scorer picks the remaining slots among the other tokens. Static Drop keeps the
+      spatial coverage, plain top-M loses it (the kept tokens cluster); cover keeps it and adds content selection.
     aux["raw_std"]: per-image std of the scores before the z-score, to watch the scale drift."""
 
-    def __init__(self, n_tokens, keep_ratio, kind, dim, hidden, grid_size=5, mode="st", temp=1.0, norm=False):
+    def __init__(self, n_tokens, keep_ratio, kind, dim, hidden, grid_size=5, mode="st", temp=1.0, norm=False,
+                 cover=0.0):
         super().__init__(n_tokens, keep_ratio)
         assert mode in ("st", "legacy"), mode
+        assert cover == 0 or mode == "st", "cover needs mode st"
         self.scorer = make_scorer(kind, dim, hidden, grid_size)
         self.mode, self.temp, self.norm = mode, temp, norm
+        n_cover = int(round(cover * (self.m - 1)))
+        assert 0 <= n_cover < self.m - 1, (cover, self.m)
+        self.register_buffer("cover_idx", torch.linspace(0, n_tokens - 1, n_cover).round().long()
+                             if n_cover else torch.zeros(0, dtype=torch.long), persistent=False)
         self.noise = 1.0  # Gumbel noise scale while training (set by train.py)
         self.frozen = False  # fixed selection, no gradient into the scores (set by train.py)
 
@@ -157,6 +166,8 @@ class PruneReducer(Reducer):
             return kept
         k = self.m - 1  # kept tokens; the M-th slot is the fused token
         assert 1 <= k < n, (n, self.m)
+        if len(self.cover_idx):  # coverage tokens: score above every other token -> always in the top k
+            sel = sel.index_fill(1, self.cover_idx, 1e4)
         top = sel.topk(k + 1, dim=1).values
         thr = ((top[:, k - 1] + top[:, k]) / 2).detach().unsqueeze(1)  # between the k-th and (k+1)-th score
         idx = sel.topk(k, dim=1).indices.sort(1).values
@@ -183,7 +194,7 @@ def scorer_hidden(kind, dim, kan_hidden=32, grid_size=5):
 
 
 def build_reducer(name, dim, grid_hw, keep_ratio, kan_hidden=32, grid_size=5, prune_mode="st", prune_temp=1.0,
-                  prune_norm=False):
+                  prune_norm=False, prune_cover=0.0):
     n = grid_hw[0] * grid_hw[1]
     if keep_ratio >= 1.0 or name == "identity":
         return Identity(n)
@@ -197,7 +208,8 @@ def build_reducer(name, dim, grid_hw, keep_ratio, kan_hidden=32, grid_size=5, pr
     if op == "pool":
         return PoolReducer(n, keep_ratio, grid_hw, kind, dim, hidden, grid_size)
     if op == "prune":
-        return PruneReducer(n, keep_ratio, kind, dim, hidden, grid_size, prune_mode, prune_temp, prune_norm)
+        return PruneReducer(n, keep_ratio, kind, dim, hidden, grid_size, prune_mode, prune_temp, prune_norm,
+                            prune_cover)
     raise ValueError(name)
 
 

@@ -29,6 +29,7 @@ Kết quả: results_fix/*.json, bảng so sánh results_fix/KET_QUA_FIX.md, log
 
 Đợt giữ 25% sau khối L (--r25_round, cùng cấu hình --ctx_round, chỉ đổi tỉ lệ giữ 0.5 -> 0.25):
   có học có thắng chọn đều khi bỏ 3/4 số token không. KANPool, MLP Pool, Static Drop, Avg Pool x seed 0/1/2   12 job
+  rồi KAN/MLP Prune + phủ đều (--prune_cover 0.5: nửa số slot ở vị trí Static Drop, nửa kia bộ chấm điểm chọn)  6 job
   Bảng: <out>/KET_QUA_R25.md (KPI đặt trước: có học hơn Static Drop ở cả 3 seed và trung bình > 2 x độ lệch)
 """
 import argparse
@@ -125,16 +126,26 @@ def jobs_ctx(a):
 
 
 # --r25_round: giữ 25% sau khối L. Mốc giữ 50% = results_ctx (cùng vị trí, cùng cấu hình), seed 0/1/2
+# phương án: (reducer, đuôi tag, cờ thêm). "cov": một nửa số slot là vị trí Static Drop, nửa kia bộ chấm điểm chọn
+R25_VARIANTS = {"kan_pool": ("kan_pool", "", []), "mlp_pool": ("mlp_pool", "", []),
+                "static_drop": ("static_drop", "", []), "avg_pool": ("avg_pool", "", []),
+                "kan_prune_cov": ("kan_prune", "_cov05", ["--prune_cover", "0.5"]),
+                "mlp_prune_cov": ("mlp_prune", "_cov05", ["--prune_cover", "0.5"])}
 R25_BASE = {"kan_pool": [87.37, 87.46, 87.30], "mlp_pool": [87.26, 87.35, 87.67],
-            "static_drop": [87.41, 86.66, 87.27], "avg_pool": []}
-R25_NAMES = {**LR_NAMES, "avg_pool": "Avg Pool"}
-R25_PAIRS = [("kan_pool", "static_drop"), ("mlp_pool", "static_drop"), ("kan_pool", "avg_pool"),
-             ("kan_pool", "mlp_pool")]
+            "static_drop": [87.41, 86.66, 87.27], "avg_pool": [], "kan_prune_cov": [], "mlp_prune_cov": []}
+R25_NAMES = {**LR_NAMES, "avg_pool": "Avg Pool", "kan_prune_cov": "KAN Prune + phủ đều",
+             "mlp_prune_cov": "MLP Prune + phủ đều"}
+R25_PAIRS = [("kan_pool", "static_drop"), ("mlp_pool", "static_drop"), ("kan_prune_cov", "static_drop"),
+             ("mlp_prune_cov", "static_drop"), ("kan_pool", "avg_pool"), ("kan_pool", "mlp_pool"),
+             ("kan_prune_cov", "mlp_prune_cov")]
 
 
 def jobs_r25(a):
     extra = ["--lr", "5e-5", "--reduce_at", str(a.reduce_at)]
-    return [(r, 0.25, s, ctx_tag(a), extra) for s in (0, 1, 2) for r in R25_BASE]
+    # 4 phương pháp gốc trước (đã giao cho Minh), 2 phương án phủ đều thêm vào cuối
+    order = list(R25_VARIANTS)[:4], list(R25_VARIANTS)[4:]
+    return [(R25_VARIANTS[v][0], 0.25, s, ctx_tag(a) + R25_VARIANTS[v][1], extra + R25_VARIANTS[v][2])
+            for group in order for s in (0, 1, 2) for v in group]
 
 
 def result_name(r, ratio, seed, tag):
@@ -359,7 +370,7 @@ def report_ctx(a, res):
 def report_r25(a, res):
     f2 = lambda x: f"{x:.2f}".replace(".", ",")
     tag = ctx_tag(a)
-    runs = {r: [res.get((r, 0.25, s, tag)) for s in (0, 1, 2)] for r in R25_BASE}
+    runs = {v: [res.get((r, 0.25, s, tag + t)) for s in (0, 1, 2)] for v, (r, t, _) in R25_VARIANTS.items()}
     gmacs = next((d["GMACs"] for ds in runs.values() for d in ds if d), None)
     L = [f"# Giữ 25% token sau khối {a.reduce_at} (CIFAR-100)", "",
          f"Cùng cấu hình results_ctx (lr backbone 5e-5, patience {a.patience}, chọn mô hình theo val), chỉ đổi tỉ lệ giữ "
@@ -372,7 +383,8 @@ def report_r25(a, res):
         cells = [f2(d["top1"]) if d else "-" for d in runs[r]]
         L.append(f"| {R25_NAMES[r]} | {' | '.join(cells)} | **{fmt(xs)}** | {fmt(base)} |")
     L += ["", "## Hiệu số ghép cặp theo seed (điểm %)", "",
-          "KPI đặt trước khi chạy: **đạt** nếu hiệu số dương ở cả 3 seed và trung bình > 2 × độ lệch chuẩn.", "",
+          "KPI đặt trước khi chạy: **đạt** nếu hiệu số dương ở cả 3 seed và trung bình > 2 × độ lệch chuẩn. "
+          "Có 4 phương pháp có học được so với Static Drop: báo cáo cả 4 dòng, không chỉ dòng tốt nhất.", "",
           "| Cặp | Từng seed | Trung bình ± độ lệch | KPI |", "|---|---|---|---|"]
     for k, m in R25_PAIRS:
         d = [x["top1"] - y["top1"] for x, y in zip(runs[k], runs[m]) if x and y]
@@ -405,7 +417,8 @@ def main():
                     help="đợt giảm token sau khối --reduce_at (KAN/MLP Prune, KAN/MLP Pool, Static Drop, 3 seed), "
                          "bảng KET_QUA_CTX.md")
     ap.add_argument("--r25_round", action="store_true",
-                    help="đợt giữ 25%% sau khối --reduce_at (KAN/MLP Pool, Static Drop, Avg Pool, 3 seed), bảng KET_QUA_R25.md")
+                    help="đợt giữ 25%% sau khối --reduce_at (KAN/MLP Pool, Static Drop, Avg Pool, KAN/MLP Prune + phủ "
+                         "đều, 3 seed), bảng KET_QUA_R25.md")
     ap.add_argument("--reduce_at", type=int, default=6, help="--ctx_round / --r25_round: giảm token trước khối này")
     ap.add_argument("--quick", action="store_true",
                     help="chạy thử: mỗi job 2 epoch x 20 bước, không đo tốc độ (dùng --out riêng, vd results_quick)")
