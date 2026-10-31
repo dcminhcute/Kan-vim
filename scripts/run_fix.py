@@ -31,6 +31,15 @@ Kết quả: results_fix/*.json, bảng so sánh results_fix/KET_QUA_FIX.md, log
   có học có thắng chọn đều khi bỏ 3/4 số token không. KANPool, MLP Pool, Static Drop, Avg Pool x seed 0/1/2   12 job
   rồi KAN/MLP Prune + phủ đều (--prune_cover 0.5: nửa số slot ở vị trí Static Drop, nửa kia bộ chấm điểm chọn)  6 job
   Bảng: <out>/KET_QUA_R25.md (KPI đặt trước: có học hơn Static Drop ở cả 3 seed và trung bình > 2 x độ lệch)
+
+Đợt 6 (--dot6): đủ ma trận đề cương. Giảm token ở đầu vào, lr backbone 5e-5, --prune_norm, patience 0 (tự bật).
+  Pha 1. CIFAR-100, 30 epoch: baseline 100% token x 3 seed, rồi KANPool, MLP Pool, Avg Pool, Max Pool, KAN Prune,
+         MLP Prune x giữ 75 / 50 / 25% x 3 seed (seed 0 của mọi mức chạy trước); Static Drop 75% / 25% chạy cuối.
+         16 job giữ 50% đã có (results_lr, cùng cấu hình) nằm ở prev_results/lr5e-5/, được chép vào --out: không chạy lại.
+         Cùng pha: baseline Tiny-ImageNet và ImageNet-100 (seed 0, --ext_epochs epoch), lưu làm teacher.
+  Pha 2. Tiny-ImageNet, ImageNet-100 rút gọn: 6 phương pháp, giữ 50%, seed 0, chưng cất từ teacher cùng dataset.
+         Thiếu data/imagenet-100 (scripts/prep_imagenet100.py) thì bỏ qua phần ImageNet-100.
+  Bảng: <out>/KET_QUA_DOT6.md, hình: <out>/fig_dot6_cifar100.png
 """
 import argparse
 import glob
@@ -148,8 +157,50 @@ def jobs_r25(a):
             for group in order for s in (0, 1, 2) for v in group]
 
 
-def result_name(r, ratio, seed, tag):
-    return f"cifar100_tiny_{r}_r{ratio}_s{seed}{'_' + tag if tag else ''}.json"
+# --dot6: đủ ma trận đề cương (giảm ở đầu vào, lr 5e-5). Job = (reducer, ratio, seed, tag, cờ thêm[, dataset])
+DOT6_TAG = "lr5e-5"
+DOT6_METHODS = ["kan_pool", "mlp_pool", "avg_pool", "max_pool", "kan_prune", "mlp_prune"]
+DOT6_RATIOS = (0.75, 0.5, 0.25)
+DOT6_NAMES = {**LR_NAMES, "identity": "Vim-Ti (100% token)", "avg_pool": "Avg Pool", "max_pool": "Max Pool"}
+DOT6_PREV = os.path.join(ROOT, "prev_results", "lr5e-5")  # 16 job giữ 50% của results_lr, cùng cấu hình
+DOT6_EXT = {"tiny-imagenet": "Tiny-ImageNet", "imagenet-100": "ImageNet-100"}
+# (a, b, tên): hiệu số a − b ghép cặp theo seed ở từng mức giữ
+DOT6_PAIRS = [("kan_pool", "kan_prune", "Gộp − loại bỏ (KAN)"), ("mlp_pool", "mlp_prune", "Gộp − loại bỏ (MLP)"),
+              ("kan_pool", "mlp_pool", "KAN − MLP (gộp)"), ("kan_prune", "mlp_prune", "KAN − MLP (loại bỏ)"),
+              ("kan_pool", "avg_pool", "KANPool − Avg Pool"), ("kan_pool", "max_pool", "KANPool − Max Pool"),
+              ("kan_pool", "static_drop", "KANPool − Static Drop")]
+
+
+def ext_teacher(a, ds):
+    return os.path.join(a.out, f"teacher_{ds}.pt")
+
+
+def jobs_dot6(a):
+    """-> [pha 1, pha 2]. Pha 2 cần teacher do pha 1 lưu, nên chỉ bắt đầu khi pha 1 xong."""
+    lr = ["--lr", "5e-5"]
+    ext = lr + ["--epochs", str(a.ext_epochs)]
+    cifar = [("identity", 1.0, s, DOT6_TAG, lr) for s in (0, 1, 2)]
+    cifar += [(r, ratio, s, DOT6_TAG, lr) for s in (0, 1, 2) for ratio in DOT6_RATIOS for r in DOT6_METHODS]
+    teachers = [("identity", 1.0, 0, DOT6_TAG, ext + ["--save_ckpt", ext_teacher(a, ds)], ds) for ds in a.ext_ds]
+    static = [("static_drop", ratio, s, DOT6_TAG, lr) for s in (0, 1, 2) for ratio in (0.75, 0.25)]
+    rest = [(r, 0.5, 0, DOT6_TAG, ext + ["--teacher_ckpt", ext_teacher(a, ds)], ds)
+            for ds in a.ext_ds for r in DOT6_METHODS]
+    if a.quick:  # chạy thử: đủ mọi loại job (baseline, gộp, loại bỏ, teacher, mỗi dataset) nhưng ít job
+        keep = {("identity", 1.0, 0), ("kan_pool", 0.25, 0), ("max_pool", 0.75, 0), ("kan_prune", 0.25, 0)}
+        return [[j for j in cifar if j[:3] in keep] + teachers, [j for j in rest if j[0] in ("kan_pool", "kan_prune")]]
+    # thứ tự pha 1: baseline + seed 0 mọi mức (đủ một đường cong sớm), teacher, seed 1/2, Static Drop
+    return [cifar[:21] + teachers + cifar[21:] + static, rest]
+
+
+def result_name(r, ratio, seed, tag, dataset="cifar100"):
+    return f"{dataset}_tiny_{r}_r{ratio}_s{seed}{'_' + tag if tag else ''}.json"
+
+
+def done(a, j):
+    if not os.path.exists(os.path.join(a.out, result_name(*j[:4], *j[5:]))):
+        return False
+    extra = j[4]  # teacher của --dot6: phải có cả file checkpoint
+    return not (a.dot6 and "--save_ckpt" in extra and not os.path.exists(extra[extra.index("--save_ckpt") + 1]))
 
 
 def log(msg):
@@ -164,6 +215,18 @@ def prepare(a):
     log("tải CIFAR-100 (một lần)")
     from kanvim.data import build_datasets
     build_datasets("cifar100", a.data_root)
+    if a.dot6:
+        log("tải Tiny-ImageNet (một lần, ~250 MB)")
+        build_datasets("tiny-imagenet", a.data_root)
+        a.ext_ds = ["tiny-imagenet"]
+        if os.path.isdir(os.path.join(a.data_root, "imagenet-100", "train")):
+            a.ext_ds.append("imagenet-100")
+        else:
+            log(f"CẢNH BÁO: chưa có {a.data_root}/imagenet-100 (xem scripts/prep_imagenet100.py) -> bỏ qua ImageNet-100")
+        os.makedirs(a.out, exist_ok=True)
+        for f in glob.glob(os.path.join(DOT6_PREV, "*.json")):
+            if not os.path.exists(os.path.join(a.out, os.path.basename(f))):
+                shutil.copy(f, a.out)
     if a.impl == "auto":
         r = subprocess.run([PY, os.path.join(ROOT, "scripts", "check_impl.py"), a.ckpt], cwd=ROOT,
                            capture_output=True, text=True)
@@ -174,9 +237,9 @@ def prepare(a):
     log(f"backbone implementation: {a.impl}")
 
 
-def command(a, r, ratio, seed, tag, extra):
-    name = os.path.splitext(result_name(r, ratio, seed, tag))[0]
-    cmd = [PY, os.path.join(ROOT, "train.py"), "--dataset", "cifar100", "--data_root", a.data_root,
+def command(a, r, ratio, seed, tag, extra, dataset="cifar100"):
+    name = os.path.splitext(result_name(r, ratio, seed, tag, dataset))[0]
+    cmd = [PY, os.path.join(ROOT, "train.py"), "--dataset", dataset, "--data_root", a.data_root,
            "--backbone", "tiny", "--ckpt", a.ckpt, "--impl", a.impl, "--batch", str(a.batch), "--workers", str(a.workers),
            "--val_size", "5000", "--mixup", "0.2", "--cutmix", "0.0", "--clip_grad", "1.0",
            "--epochs", "30", "--patience", str(a.patience), "--lr", "1e-4", "--teacher_ckpt", a.teacher,
@@ -189,18 +252,40 @@ def command(a, r, ratio, seed, tag, extra):
     return name, cmd
 
 
+def job_phases(a):
+    """Các pha chạy lần lượt; trong một pha, mỗi GPU lấy job tiếp theo trong hàng đợi."""
+    if a.dot6:
+        return jobs_dot6(a)
+    return [jobs_r25(a) if a.r25_round else jobs_ctx(a) if a.ctx_round else jobs_stab() if a.stab_round
+            else jobs_lr() if a.lr_round else jobs()]
+
+
 def run_all(a, gpus):
-    all_jobs = jobs_r25(a) if a.r25_round else jobs_ctx(a) if a.ctx_round else jobs_stab() if a.stab_round else jobs_lr() if a.lr_round else jobs()
-    todo = [j for j in all_jobs if not os.path.exists(os.path.join(a.out, result_name(*j[:4])))]
-    log(f"{len(all_jobs)} job, đã xong {len(all_jobs) - len(todo)}, còn {len(todo)}, GPU {gpus}")
-    if a.limit:
-        todo = todo[:a.limit]
-        log(f"chạy thử: chỉ {len(todo)} job đầu")
-    q = queue.Queue()
-    for j in todo:
-        q.put(j)
+    phases = job_phases(a)
+    n_all = sum(len(p) for p in phases)
+    n_todo = sum(not done(a, j) for p in phases for j in p)
+    log(f"{n_all} job, đã xong {n_all - n_todo}, còn {n_todo}, GPU {gpus}")
     os.makedirs(os.path.join(a.out, "logs"), exist_ok=True)
     failed = []
+    left = a.limit
+    for phase in phases:
+        todo = [j for j in phase if not done(a, j)]
+        if a.limit:
+            todo, left = todo[:left], left - len(todo[:left])
+            log(f"chạy thử: chỉ {len(todo)} job đầu của pha này")
+        run_phase(a, gpus, todo, failed)
+    return failed
+
+
+def run_phase(a, gpus, todo, failed):
+    q = queue.Queue()
+    for j in todo:
+        if "--teacher_ckpt" in j[4] and not os.path.exists(j[4][j[4].index("--teacher_ckpt") + 1]):
+            name = os.path.splitext(result_name(*j[:4], *j[5:]))[0]
+            log(f"bỏ qua {name}: chưa có teacher (job baseline cùng dataset lỗi?)")
+            failed.append(name)
+            continue
+        q.put(j)
 
     def worker(g):
         while True:
@@ -225,7 +310,6 @@ def run_all(a, gpus):
         t.start()
     for t in ts:
         t.join()
-    return failed
 
 
 def fmt(xs):
@@ -235,7 +319,23 @@ def fmt(xs):
     return s + (f" ± {statistics.stdev(xs):.2f}".replace(".", ",") if len(xs) > 1 else "")
 
 
-def load_results(out):
+def fmt_d(d):
+    """Hiệu số có dấu: '+1,23 ± 0,20'."""
+    if not d:
+        return "-"
+    s = f"{statistics.mean(d):+.2f}".replace(".", ",")
+    return s + (f" ± {statistics.stdev(d):.2f}".replace(".", ",") if len(d) > 1 else "")
+
+
+def kpi(d):
+    """KPI đặt trước: dương ở cả 3 seed và trung bình > 2 x độ lệch chuẩn."""
+    if len(d) < 3:
+        return f"chờ ({len(d)}/3 seed)"
+    return "**đạt**" if all(x > 0 for x in d) and statistics.mean(d) > 2 * statistics.stdev(d) else "không đạt"
+
+
+def load_results(out, with_ds=False):
+    """with_ds: khoá có thêm dataset ở đầu (--dot6 có nhiều dataset trong cùng thư mục)."""
     res = {}
     for f in glob.glob(os.path.join(out, "*.json")):
         try:
@@ -243,11 +343,14 @@ def load_results(out):
         except ValueError:  # job ở GPU kia đang ghi dở file này, lần cập nhật sau sẽ đọc
             continue
         k = d["args"]
-        res[(k["reducer"], k["ratio"], k["seed"], k.get("tag", ""))] = d
+        key = (k["reducer"], k["ratio"], k["seed"], k.get("tag", ""))
+        res[(k["dataset"],) + key if with_ds else key] = d
     return res
 
 
 def report(a):
+    if a.dot6:
+        return report_dot6(a)
     res = load_results(a.out)
     if a.r25_round:
         return report_r25(a, res)
@@ -388,15 +491,108 @@ def report_r25(a, res):
           "| Cặp | Từng seed | Trung bình ± độ lệch | KPI |", "|---|---|---|---|"]
     for k, m in R25_PAIRS:
         d = [x["top1"] - y["top1"] for x, y in zip(runs[k], runs[m]) if x and y]
-        if len(d) < 3:
-            verdict = f"chờ ({len(d)}/3 seed)"
-        elif all(x > 0 for x in d) and statistics.mean(d) > 2 * statistics.stdev(d):
-            verdict = "**đạt**"
-        else:
-            verdict = "không đạt"
         L.append(f"| {R25_NAMES[k]} − {R25_NAMES[m]} | {' / '.join(f'{x:+.2f}'.replace('.', ',') for x in d) or '-'} "
-                 f"| {fmt(d)} | {verdict} |")
+                 f"| {fmt(d)} | {kpi(d)} |")
     open(os.path.join(a.out, "KET_QUA_R25.md"), "w", encoding="utf-8").write("\n".join(L) + "\n")
+
+
+def report_dot6(a):
+    f2 = lambda x: f"{x:.2f}".replace(".", ",")
+    res = load_results(a.out, with_ds=True)
+    runs = lambda ds, r, ratio, seeds=(0, 1, 2): [res.get((ds, r, ratio, s, DOT6_TAG)) for s in seeds]
+    top = lambda ds, r, ratio: [d["top1"] for d in runs(ds, r, ratio) if d]
+    base = top("cifar100", "identity", 1.0)
+    rows = DOT6_METHODS + ["static_drop"]
+    gm = {ratio: next((d["GMACs"] for d in runs("cifar100", "kan_pool", ratio) if d), None) for ratio in DOT6_RATIOS}
+    L = ["# Đợt 6: đủ ma trận đề cương (giảm token ở đầu vào)", "",
+         "Cấu hình chung: Vim-Ti pretrain ImageNet-1K, lr backbone 5e-5, lr head và bộ chấm điểm 1e-3, Prune st + "
+         "--prune_norm, mixup 0,2, chưng cất từ baseline cùng dataset, chọn mô hình theo val, test dùng 1 lần. "
+         "Baseline không chưng cất.", "",
+         f"## CIFAR-100 (30 epoch, 3 seed)", "",
+         f"Baseline Vim-Ti (100% token, 1,47 GMACs): **{fmt(base)}** (n={len(base)}).", "",
+         "Test top-1 (%), trung bình ± độ lệch; trong ngoặc: chênh so với trung bình baseline. "
+         "n < 3 = chưa đủ seed. Static Drop giữ 50% lấy từ results_lr.", "",
+         "| Phương pháp | " + " | ".join(f"Giữ {round(r * 100)}% ({f2(gm[r]) if gm[r] else '-'} GMACs)"
+                                      for r in DOT6_RATIOS) + " |",
+         "|---|---|---|---|"]
+    for r in rows:
+        cells = []
+        for ratio in DOT6_RATIOS:
+            xs = top("cifar100", r, ratio)
+            c = fmt(xs) + (f" (n={len(xs)})" if 0 < len(xs) < 3 else "")
+            if xs and base:
+                c += f" ({statistics.mean(xs) - statistics.mean(base):+.2f})".replace(".", ",")
+            cells.append(c)
+        L.append(f"| {DOT6_NAMES[r]} | {' | '.join(cells)} |")
+    L += ["", "### Hiệu số ghép cặp theo seed (điểm %)", "",
+          "KPI đặt trước: **đạt** nếu hiệu số dương ở cả 3 seed và trung bình > 2 × độ lệch chuẩn. "
+          "Hai dòng đầu trả lời \"khi nào gộp, khi nào loại bỏ\" ở từng mức giữ.", "",
+          "| Cặp | Giữ 75% | Giữ 50% | Giữ 25% |", "|---|---|---|---|"]
+    for k, m, name in DOT6_PAIRS:
+        cells = []
+        for ratio in DOT6_RATIOS:
+            d = [x["top1"] - y["top1"] for x, y in zip(runs("cifar100", k, ratio), runs("cifar100", m, ratio)) if x and y]
+            cells.append(f"{fmt_d(d)}, {kpi(d)}" if d else "-")
+        L.append(f"| {name} | {' | '.join(cells)} |")
+    b0 = res.get(("cifar100", "identity", 1.0, 0, DOT6_TAG))
+    if b0 and b0.get("throughput"):
+        L += ["", "### Tốc độ và bộ nhớ khi suy luận (seed 0, lô 64, đo ngay sau huấn luyện)", "",
+              f"Baseline: {b0['throughput']:.0f} ảnh/s, {b0['vram_MB']:.0f} MB. Ô: tăng tốc so với baseline / VRAM (MB). "
+              "GPU còn lại đang chạy job khác nên số có nhiễu; số để báo cáo nên đo lại bằng scripts/bench.py.", "",
+              "| Phương pháp | Giữ 75% | Giữ 50% | Giữ 25% |", "|---|---|---|---|"]
+        for r in rows:
+            cells = []
+            for ratio in DOT6_RATIOS:
+                d = res.get(("cifar100", r, ratio, 0, DOT6_TAG))
+                cells.append(f"{d['throughput'] / b0['throughput']:.2f}× / {d['vram_MB']:.0f}".replace(".", ",")
+                             if d and d.get("throughput") else "-")
+            L.append(f"| {DOT6_NAMES[r]} | {' | '.join(cells)} |")
+    for ds, title in DOT6_EXT.items():
+        b = res.get((ds, "identity", 1.0, 0, DOT6_TAG))
+        L += ["", f"## {title} (rút gọn: giữ 50%, seed 0, {a.ext_epochs} epoch)", "",
+              "| Phương pháp | Test top-1 (%) | Chênh so với baseline | Epoch tốt nhất |", "|---|---|---|---|",
+              f"| {DOT6_NAMES['identity']} | {f2(b['top1']) if b else '-'} | — | "
+              f"{b['best_epoch'] if b else '-'}/{len(b['log']) if b else '-'} |"]
+        for r in DOT6_METHODS:
+            d = res.get((ds, r, 0.5, 0, DOT6_TAG))
+            diff = f"{d['top1'] - b['top1']:+.2f}".replace(".", ",") if d and b else "-"
+            L.append(f"| {DOT6_NAMES[r]} | {f2(d['top1']) if d else '-'} | {diff} | "
+                     f"{d['best_epoch'] if d else '-'}/{len(d['log']) if d else '-'} |")
+    open(os.path.join(a.out, "KET_QUA_DOT6.md"), "w", encoding="utf-8").write("\n".join(L) + "\n")
+    plot_dot6(a, res, base)
+
+
+def plot_dot6(a, res, base):
+    """Đường cong đánh đổi Top-1 theo GMACs trên CIFAR-100 (trung bình ± độ lệch qua các seed)."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    for r in DOT6_METHODS + ["static_drop"]:
+        pts = []
+        for ratio in DOT6_RATIOS:
+            ds = [res.get(("cifar100", r, ratio, s, DOT6_TAG)) for s in (0, 1, 2)]
+            xs = [d["top1"] for d in ds if d]
+            if xs:
+                pts.append((next(d["GMACs"] for d in ds if d), statistics.mean(xs),
+                            statistics.stdev(xs) if len(xs) > 1 else 0.0))
+        if pts:
+            ax.errorbar(*zip(*[(g, m) for g, m, _ in pts]), yerr=[s for *_, s in pts], marker="o", capsize=3,
+                        linestyle="--" if "prune" in r or r == "static_drop" else "-", label=DOT6_NAMES[r])
+    if base:
+        ax.errorbar([1.467], [statistics.mean(base)], yerr=[statistics.stdev(base) if len(base) > 1 else 0.0],
+                    marker="*", markersize=12, color="black", capsize=3, label=DOT6_NAMES["identity"])
+    ax.set_xlabel("GMACs / ảnh")
+    ax.set_ylabel("Top-1 trên tập kiểm tra (%)")
+    ax.set_title("CIFAR-100: độ chính xác theo chi phí (nét liền: gộp, nét đứt: loại bỏ)")
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(os.path.join(a.out, "fig_dot6_cifar100.png"), dpi=150)
+    plt.close(fig)
 
 
 def main():
@@ -419,6 +615,10 @@ def main():
     ap.add_argument("--r25_round", action="store_true",
                     help="đợt giữ 25%% sau khối --reduce_at (KAN/MLP Pool, Static Drop, Avg Pool, KAN/MLP Prune + phủ "
                          "đều, 3 seed), bảng KET_QUA_R25.md")
+    ap.add_argument("--dot6", action="store_true",
+                    help="đợt 6: CIFAR-100 đủ 7 phương pháp x giữ 75/50/25%% x 3 seed + Tiny-ImageNet / ImageNet-100 "
+                         "rút gọn, giảm ở đầu vào, lr 5e-5; bảng KET_QUA_DOT6.md")
+    ap.add_argument("--ext_epochs", type=int, default=10, help="--dot6: số epoch cho Tiny-ImageNet và ImageNet-100")
     ap.add_argument("--reduce_at", type=int, default=6, help="--ctx_round / --r25_round: giảm token trước khối này")
     ap.add_argument("--quick", action="store_true",
                     help="chạy thử: mỗi job 2 epoch x 20 bước, không đo tốc độ (dùng --out riêng, vd results_quick)")
@@ -426,8 +626,11 @@ def main():
     ap.add_argument("--gpus", default=None, help="vd '0,1'. Mặc định: tất cả GPU")
     ap.add_argument("--workers", type=int, default=min(12, os.cpu_count() or 4))
     a = ap.parse_args()
-    if a.stab_round or a.ctx_round or a.r25_round:
+    a.ext_ds = []  # --dot6: prepare() điền các dataset phụ có sẵn
+    if a.stab_round or a.ctx_round or a.r25_round or a.dot6:
         a.prune_norm = True
+    if a.dot6:
+        a.patience = 0  # như results_lr: 16 job giữ 50% dùng lại phải cùng cấu hình
     import torch
     gpus = [int(g) for g in a.gpus.split(",")] if a.gpus else list(range(torch.cuda.device_count()))
     if not gpus:
@@ -440,7 +643,7 @@ def main():
     shutil.make_archive(a.out, "zip", os.path.dirname(a.out), os.path.basename(a.out))
     done = "XONG CHẠY THỬ" if a.limit else "XONG TOÀN BỘ"
     log(f"{done if not failed else 'XONG, có job lỗi: ' + ', '.join(failed)}. "
-        f"Bảng: {a.out}/{'KET_QUA_R25.md' if a.r25_round else 'KET_QUA_CTX.md' if a.ctx_round else 'KET_QUA_STAB.md' if a.stab_round else 'KET_QUA_LR.md' if a.lr_round else 'KET_QUA_FIX.md'}"
+        f"Bảng: {a.out}/{'KET_QUA_DOT6.md' if a.dot6 else 'KET_QUA_R25.md' if a.r25_round else 'KET_QUA_CTX.md' if a.ctx_round else 'KET_QUA_STAB.md' if a.stab_round else 'KET_QUA_LR.md' if a.lr_round else 'KET_QUA_FIX.md'}"
         f" | tải về: {a.out}.zip")
 
 
